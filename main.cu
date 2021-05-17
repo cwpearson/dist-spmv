@@ -8,10 +8,17 @@
 
 #include "cuda_runtime.hpp"
 
+#define STRINGIFY(x) #x
+#define TOSTRING(x) STRINGIFY(x)
+#define AT __FILE__ ":" TOSTRING(__LINE__) 
+
+//#define VIEW_CHECK_BOUNDS
+
 template<typename ForwardIt>
 void shift_left(ForwardIt first, ForwardIt last, size_t n) {
-    for (size_t i = 0; i < last-first; ++i) {
-        *(first-n+i) = *(first+i);
+    while(first != last) {
+        *(first-n) = *first;
+        ++first;
     }
 }
 
@@ -29,11 +36,7 @@ enum class Where {
 };
 
 template <Where where, typename T>
-class Array {
-public:
-    Array();
-    int64_t size() const;
-};
+class Array;
 
 
 /* device array
@@ -50,36 +53,76 @@ public:
         public:
         View() : data_(nullptr), size_(0){}
         View(const View &other) = default;
+        View(View &&other) = default;
+        View &operator=(const View &rhs) = default;
 
-        // create view from array
-        View(const Array &a) {
-            size_ = a.size();
-            data_ = a.data_;
+        __host__ __device__ int64_t size() const { return size_; }
+
+        __device__ const T &operator()(int64_t i) const {
+#ifdef VIEW_CHECK_BOUNDS
+            if (i < 0) {
+                printf("ERR: i < 0: %d\n", i);
+            }
+            if (i >= size_) {
+                printf("ERR: i > size_: %d > %ld\n", i, size_);
+            }
+#endif
+            return data_[i];
         }
-        __device__ int64_t size() const { return size_; }
+        __device__ T &operator()(int64_t i) {
+            return data_[i];
+        }
     };
 
     // array owns the data in this view
     View view_;
 public:
     Array() = default;
+    Array(const size_t n) {
+        resize(n);
+    }
     Array(const Array &other) = delete;
+    Array(Array &&other) : view_(other.view_) {
+        // view is non-owning, so have to clear other
+        other.view_.data_ = nullptr;
+        other.view_.size_ = 0;
+    }
 
     Array(const std::vector<T> &v) {
-        view_.size_ = v.size();
-        CUDA_RUNTIME(cudaMalloc(&view_.data_, view_.size_ * sizeof(T)));
-        CUDA_RUNTIME(cudaMemcpy(view_.data_, v.data(), view_.size_ * sizeof(T), cudaMemcpyHostToDevice));
+        set_from(v);
     }
     ~Array() {
         CUDA_RUNTIME(cudaFree(view_.data_));
         view_.data_ = nullptr;
         view_.size_ = 0;
     }
-    int64_t size() const { return view_.size(); }
+    int64_t size() const { 
+        return view_.size(); }
 
     View view() const {
         return view_; // copy of internal view
     }
+
+    operator std::vector<T>() const {
+        std::vector<T> v(size());
+        CUDA_RUNTIME(cudaMemcpy(v.data(), view_.data_, size() * sizeof(T), cudaMemcpyDeviceToHost));
+        return v;
+    }
+
+    void set_from(const std::vector<T> &rhs, cudaStream_t stream = 0) {
+        resize(rhs.size());
+        CUDA_RUNTIME(cudaMemcpyAsync(view_.data_, rhs.data(), view_.size_ * sizeof(T), cudaMemcpyHostToDevice, stream));
+    }
+
+    // any change destroys all data
+    void resize(size_t n) {
+        if (size() != n) {
+            view_.size_ = n;
+            CUDA_RUNTIME(cudaFree(view_.data_));
+            CUDA_RUNTIME(cudaMalloc(&view_.data_, view_.size_ * sizeof(T)));
+        }
+    }
+
 };
 
 class CooMat {
@@ -105,6 +148,8 @@ public:
     };
 
 private:
+
+    // sorted during construction
     std::vector<Entry> data_;
     int64_t numRows_;
     int64_t numCols_;
@@ -113,7 +158,18 @@ public:
     CooMat(int m, int n) : numRows_(m), numCols_(n) {}
     const std::vector<Entry> &entries() const {return data_;}
     void push_back(int i, int j, int e) {
-        data_.push_back(Entry(i, j, e));
+
+        Entry entry(i,j,e);
+
+        // first position not less than entry
+        auto lb = std::lower_bound(data_.begin(), data_.end(), entry, Entry::by_ij);
+
+        // overwrite if already exists
+        if (lb != data_.end() && lb->i == entry.i && lb->j == entry.j) {
+            *lb = entry;
+        } else {
+            data_.insert(lb, entry);
+        }
     }
 
     void sort() {
@@ -121,7 +177,7 @@ public:
     }
 
     int64_t num_rows() const {return numRows_;}
-    int64_t num_cols() const {return numRows_;}
+    int64_t num_cols() const {return numCols_;}
     int64_t nnz() const {return data_.size();}
 };
 
@@ -146,8 +202,8 @@ template<> class CsrMat<Where::host>
 
 public:
     CsrMat() = default;
-    CsrMat(int numRows, int numCols, int nnz) : rowPtr_(numRows+1), colInd_(nnz), val_(nnz) {}
-    
+    CsrMat(int numRows, int numCols, int nnz) : rowPtr_(numRows+1), colInd_(nnz), val_(nnz), numCols_(numCols) {}
+
     CsrMat(const CooMat &coo) : numCols_(coo.num_cols()) {
         for (auto &e : coo.entries()) {
             while (rowPtr_.size() <= e.i) {
@@ -196,21 +252,21 @@ public:
         }
         // erase rows after
         // dont want to keep rowEnd, so rowEnd points to end of rowEnd-1
-        std::cerr << "resize rowPtr_ to " << rowEnd+1 << "\n";
+        std::cerr << "rowPtr_ = rowPtr[:" << rowEnd+1 << "]\n";
         rowPtr_.resize(rowEnd+1);
         std::cerr << "resize entries to " << rowPtr_.back() << "\n";
         colInd_.resize(rowPtr_.back());
         val_.resize(rowPtr_.back());
 
         // erase early row pointers
-        std::cerr << "shl rowPtr by " << rowStart << "\n";
+        std::cerr << "rowPtr <<= " << rowStart << "\n";
         shift_left(rowPtr_.begin()+rowStart, rowPtr_.end(), rowStart);
         std::cerr << "resize rowPtr to " << rowEnd - rowStart+1 << "\n";
         rowPtr_.resize(rowEnd-rowStart+1);
 
         const int off = rowPtr_[0];
         // erase entries for first rows
-        std::cerr << "shl entries by " << off << "\n";
+        std::cerr << "entries <<= " << off << "\n";
         shift_left(colInd_.begin()+off, colInd_.end(), off);
         shift_left(val_.begin()+off, val_.end(), off);
 
@@ -250,11 +306,28 @@ public:
                 return 0;
             }
         }
+
+        __device__ const int &row_ptr(int64_t i) const {
+            return rowPtr_(i);
+        }
+
+        __device__ const int &col_ind(int64_t i) const {
+            return colInd_(i);
+        }
+
+        __device__ const float &val(int64_t i) const {
+            return val_(i);
+        }
+
     };
 
+    CsrMat() = delete;
+    CsrMat(CsrMat &&other) = delete;
+    CsrMat(const CsrMat &other) = delete;
+
     // create device matrix from host
-    CsrMat(const CsrMat<Where::host> &m) :
-    rowPtr_(m.rowPtr_), colInd_(m.colInd_), val_(m.val_) {
+    CsrMat(const CsrMat<Where::host> &m) : 
+        rowPtr_(m.rowPtr_), colInd_(m.colInd_), val_(m.val_) {
         if (colInd_.size() != val_.size()) {
             throw std::logic_error("bad invariant");
         }
@@ -279,8 +352,6 @@ public:
         v.colInd_ = colInd_.view();
         v.val_ = val_.view();
         return v;
-
-
     }
 
 };
@@ -290,8 +361,13 @@ public:
 
 // mxn random matrix with nnz
 CsrMat<Where::host> random_matrix(const int64_t m, const int64_t n, const int64_t nnz) {
+
+    if (m * n < nnz) {
+        throw std::logic_error(AT);
+    }
+
     CooMat coo(m,n);
-    for (int i = 0; i < nnz; ++i) {
+    while(coo.nnz() < nnz) {
         int r = rand() % m;
         int c = rand() % n;
         float e = 1.0;
@@ -308,42 +384,58 @@ std::vector<float> random_vector(const int64_t n) {
     return std::vector<float>(n, 1.0);
 }
 
+struct Range {
+    int lb;
+    int ub;
+};
+
+/* get the ith part of splitting domain in to n pieces
+*/
+Range get_partition(const int domain, const int i, const int n) {
+    int div = domain / n;
+    int rem = domain % n;
+
+    int lb, ub;
+
+    if (i < rem) {
+        lb = i * (div+1);
+        ub = lb + (div+1);
+    } else {
+        lb = rem * (div+1) + (i-rem) * div;
+        ub = lb + div;
+    }
+    return Range{.lb=lb, .ub=ub};
+}
+
 std::vector<CsrMat<Where::host>> part_by_rows(const CsrMat<Where::host> &m, const int parts) {
 
     std::vector<CsrMat<Where::host>> mats;
 
-    int rowStart = 0;
     for (int p = 0; p < parts; ++p) {
-        int partSize = m.num_rows() / parts;
-        if (p < m.num_rows() % parts) {
-            ++partSize;
-        }
-        std::cerr << "matrix part " << p << " has " << partSize << " rows\n";
-        const int rowEnd = rowStart + partSize;
+        Range range = get_partition(m.num_rows(), p, parts);
+        std::cerr << "matrix part " << p << " has " << range.ub-range.lb << " rows\n";
         CsrMat<Where::host> part(m);
-        part.retain_rows(rowStart, rowEnd);
-        rowStart = rowEnd;
+        part.retain_rows(range.lb, range.ub);
         mats.push_back(part);
     }
 
     return mats;
 }
 
+
 std::vector<std::vector<float>> part_by_rows(const std::vector<float> &x, const int parts) {
     std::vector<std::vector<float>> xs;
 
-    int rowStart = 0;
     for (int p = 0; p < parts; ++p) {
-        int partSize = x.size() / parts;
-        if (p < x.size() % parts) {
-            ++partSize;
-        }
-        std::cerr << "vector part " << p << " has " << partSize << " rows\n";
-        const int rowEnd = rowStart + partSize;
-        std::vector<float> part(x.begin()+rowStart, x.begin()+rowEnd);
+        Range range = get_partition(x.size(), p, parts);
+        std::cerr << "vector part " << p << " will have " << range.ub-range.lb << " rows\n";
+        std::vector<float> part(x.begin()+range.lb, x.begin()+range.ub);
         xs.push_back(part);
     }
 
+    if (xs.size() != parts) {
+        throw std::logic_error("line " STRINGIFY(__LINE__));
+    }
     return xs;
 }
 
@@ -412,34 +504,47 @@ std::vector<float> receive_vector(int dst, int src, MPI_Comm comm) {
     return x;
 }
 
+/* Ax=b
+*/
 __global__ void spmv(Array<Where::device, float>::View b, const CsrMat<Where::device>::View A, const Array<Where::device, float>::View x) {
 
-    // one block per row
-    for (int r = blockIdx.x; r < A.num_rows(); r += gridDim.x) {
-
+    // one thread per row
+    for (int r = blockDim.x * blockIdx.x + threadIdx.x; r < A.num_rows(); r += blockDim.x * gridDim.x) {
+        float acc = 0;
+        for (int ci = A.row_ptr(r); ci < A.row_ptr(r+1); ++ci) {
+            int c = A.col_ind(ci);
+            acc += A.val(ci) * x(c);
+        }
+        b(r) = acc;
     }
 
 }
 
 int main (int argc, char **argv) {
 
-MPI_Init(&argc, &argv);
+    MPI_Init(&argc, &argv);
 
-    int rank, size;
+    std::cerr << "get a gpu...\n";
+    CUDA_RUNTIME(cudaFree(0));
+    std::cerr << "barrier...\n";
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    int rank = 0;
+    int size = 1;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
   
     int64_t m = 100;
     int64_t n = 50;
-    int64_t nnz = 5000;
+    int64_t nnz = 100;
 
     CsrMat<Where::host> A;
     std::vector<float> x;
 
-    // generate and send or recv A
+    // generate and distribute A and x
     if (0 == rank) {
         A = random_matrix(m, n, nnz);
-        std::vector<float> x = random_vector(n);
+        x = random_vector(n);
         std::vector<CsrMat<Where::host>> As = part_by_rows(A, size);
         std::vector<std::vector<float>> xs = part_by_rows(x, size);
         for (size_t dst = 1; dst < size; ++dst) {
@@ -457,20 +562,71 @@ MPI_Init(&argc, &argv);
         x = receive_vector(rank, 0, MPI_COMM_WORLD);
     }
 
-    // Product vector size is same as local rows of A
-    std::vector<float> b(A.num_rows());
-
-    // get GPU versions
+    std::cerr << "A[" << A.num_rows() << "," << A.num_cols() << "] w/ " << A.nnz() << "\n";
+    std::cerr << "Copy A to GPU\n";
     CsrMat<Where::device> Ad(A);
-    Array<Where::device, float> xd(x);
+
+
+    // Product vector size is same as local rows of A
+    std::vector<float> b(A.num_rows(), 0);
+    std::cerr << "Copy b to GPU\n";
     Array<Where::device, float> bd(b);
 
+
+    // plan allgather of complete x
+    std::cerr << "plan allgather xs\n";
+    std::vector<float> lx(A.num_cols());
+    Array<Where::device, float> lxd(A.num_cols());
+    std::vector<int> recvcounts;
+    std::vector<int> displs;
+    for (int i = 0; i < size; ++i) {
+        Range r = get_partition(lx.size(), i, size);
+        recvcounts.push_back(r.ub-r.lb);
+        if (displs.empty()) {
+            displs.push_back(0);
+        } else {
+            displs.push_back(displs.back() + recvcounts.back());
+        }
+    }
+
+    
+
+    cudaStream_t stream;
+    CUDA_RUNTIME(cudaStreamCreate(&stream));
     // do spmv
-    dim3 dimBlock(32,8,1);
+    dim3 dimBlock(256);
     dim3 dimGrid(100);
-    spmv<<<dimGrid, dimBlock>>>(bd.view(), Ad.view(), xd.view());
-    CUDA_RUNTIME(cudaDeviceSynchronize());
 
-MPI_Finalize();
+    for (int i = 0; i < 10; ++i) {
 
+        // distribute x to ranks
+        std::cerr << "Allgather xs\n";
+        MPI_Allgatherv(x.data(), x.size(), MPI_FLOAT, lx.data(), recvcounts.data(), displs.data(), MPI_FLOAT, MPI_COMM_WORLD);
+
+        std::cerr << "Copy x to GPU\n";
+        lxd.set_from(lx, stream);
+
+        std::cerr << "launch spmv\n";
+        spmv<<<dimGrid, dimBlock, 0, stream>>>(bd.view(), Ad.view(), lxd.view());
+        CUDA_RUNTIME(cudaGetLastError());
+        CUDA_RUNTIME(cudaStreamSynchronize(stream));
+        std::cerr << "done spmv\n";
+
+        // copy product back to host
+        // b = bd;
+
+        // for (int r = 0; r < size; ++r) {
+        //     MPI_Barrier(MPI_COMM_WORLD);
+        //     if (rank == r) {
+        //         for (auto &e : b) {
+        //             std::cout << e << "\n";
+        //         }
+        //     }
+        // }
+
+    }
+
+    MPI_Finalize();
+
+    return 0;
 }
