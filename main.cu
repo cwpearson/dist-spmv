@@ -442,11 +442,43 @@ CsrMat<Where::host> random_matrix(const int64_t m, const int64_t n, const int64_
     CooMat coo(m,n);
     while(coo.nnz() < nnz) {
 
-        int toPush = nnz - coo.nnz();
+        int64_t toPush = nnz - coo.nnz();
         std::cerr << "adding " << toPush << " non-zeros\n";
-        for (int _ = 0; _ < toPush; ++_) {
+        for (int64_t _ = 0; _ < toPush; ++_) {
             int r = rand() % m;
             int c = rand() % n;
+            float e = 1.0;
+            coo.push_back(r, c, e);
+        }
+        std::cerr << "removing duplicate non-zeros\n";
+        coo.remove_duplicates();
+    }
+    coo.sort();
+    std::cerr << "coo: " << coo.num_rows() << "x" << coo.num_cols() << "\n";
+    CsrMat<Where::host> csr(coo);
+    std::cerr << "csr: " << csr.num_rows() << "x" << csr.num_cols() << " w/ " << csr.nnz() << "\n";
+    return csr;
+};
+
+// nxn diagonal matrix with bandwidth b
+CsrMat<Where::host> random_band_matrix(const int64_t n, const int64_t bw, const int64_t nnz) {
+
+    CooMat coo(n,n);
+    while(coo.nnz() < nnz) {
+
+        int64_t toPush = nnz - coo.nnz();
+        std::cerr << "adding " << toPush << " non-zeros\n";
+        for (int64_t _ = 0; _ < toPush; ++_) {
+            int r = rand() % n; // random row
+
+            // column in the band
+            int lb = r - bw;
+            int ub = r + bw + 1;
+            int64_t c = rand() % (ub - lb) + lb;
+            if (c < 0 || c > n) {
+                continue; // don't over-weight first or last column
+            }
+            
             float e = 1.0;
             coo.push_back(r, c, e);
         }
@@ -682,13 +714,18 @@ int main (int argc, char **argv) {
     MPI_Comm_size(MPI_COMM_WORLD, &size);
   
     std::cerr << "get a gpu...\n";
-    CUDA_RUNTIME(cudaSetDevice(rank));
+    CUDA_RUNTIME(cudaSetDevice(rank % 4));
     CUDA_RUNTIME(cudaFree(0));
     std::cerr << "barrier...\n";
     MPI_Barrier(MPI_COMM_WORLD);
 
+    // int64_t m = 150000;
+    // int64_t n = 150000;
+    // int64_t nnz = 11000000;
+    // or
     int64_t m = 150000;
-    int64_t n = 150000;
+    int64_t n = m;
+    int64_t bw = m/size; // ~50% local vs remote non-zeros for most ranks
     int64_t nnz = 11000000;
 
     CsrMat<Where::host> lA; // "local A"
@@ -696,7 +733,8 @@ int main (int argc, char **argv) {
     // generate and distribute A
     if (0 == rank) {
         std::cerr << "generate matrix\n";
-        lA = random_matrix(m, n, nnz);
+        // lA = random_matrix(m, n, nnz);
+        lA = random_band_matrix(m, bw, nnz);
         std::cerr << "partition matrix\n";
         std::vector<CsrMat<Where::host>> As = part_by_rows(lA, size);
         for (size_t dst = 1; dst < size; ++dst) {
