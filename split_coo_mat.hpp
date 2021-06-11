@@ -45,6 +45,7 @@ SplitCooMat split_local_remote(const CsrMat<Where::host> &m, MPI_Comm comm) {
 
     // which rows of x are local
     Range localRange = get_partition(m.num_cols(), rank, size);
+    std::cerr << "[" << localRange.lb <<","<< localRange.ub << ")\n";
     int loff = localRange.lb;
 
     // build two matrices, local gets local non-zeros, remote gets remote non-zeros

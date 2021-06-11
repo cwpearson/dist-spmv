@@ -10,91 +10,13 @@
 #include <iostream>
 #include <map>
 
+//#define VIEW_CHECK_BOUNDS
+
+#include "at.hpp"
 #include "cuda_runtime.hpp"
 #include "csr_mat.hpp"
 #include "row_part_spmv.cuh"
 
-#define STRINGIFY(x) #x
-#define TOSTRING(x) STRINGIFY(x)
-#define AT __FILE__ ":" TOSTRING(__LINE__) 
-
-//#define VIEW_CHECK_BOUNDS
-
-
-// mxn random matrix with nnz
-CsrMat<Where::host> random_matrix(const int64_t m, const int64_t n, const int64_t nnz) {
-
-    if (m * n < nnz) {
-        throw std::logic_error(AT);
-    }
-
-    CooMat coo(m,n);
-    while(coo.nnz() < nnz) {
-
-        int64_t toPush = nnz - coo.nnz();
-        std::cerr << "adding " << toPush << " non-zeros\n";
-        for (int64_t _ = 0; _ < toPush; ++_) {
-            int r = rand() % m;
-            int c = rand() % n;
-            float e = 1.0;
-            coo.push_back(r, c, e);
-        }
-        std::cerr << "removing duplicate non-zeros\n";
-        coo.remove_duplicates();
-    }
-    coo.sort();
-    std::cerr << "coo: " << coo.num_rows() << "x" << coo.num_cols() << "\n";
-    CsrMat<Where::host> csr(coo);
-    std::cerr << "csr: " << csr.num_rows() << "x" << csr.num_cols() << " w/ " << csr.nnz() << "\n";
-    return csr;
-};
-
-// nxn diagonal matrix with bandwidth b
-CsrMat<Where::host> random_band_matrix(const int64_t n, const int64_t bw, const int64_t nnz) {
-
-    CooMat coo(n,n);
-    while(coo.nnz() < nnz) {
-
-        int64_t toPush = nnz - coo.nnz();
-        std::cerr << "adding " << toPush << " non-zeros\n";
-        for (int64_t _ = 0; _ < toPush; ++_) {
-            int r = rand() % n; // random row
-
-            // column in the band
-            int lb = r - bw;
-            int ub = r + bw + 1;
-            int64_t c = rand() % (ub - lb) + lb;
-            if (c < 0 || c > n) {
-                continue; // don't over-weight first or last column
-            }
-            
-            float e = 1.0;
-            coo.push_back(r, c, e);
-        }
-        std::cerr << "removing duplicate non-zeros\n";
-        coo.remove_duplicates();
-    }
-    coo.sort();
-    std::cerr << "coo: " << coo.num_rows() << "x" << coo.num_cols() << "\n";
-    CsrMat<Where::host> csr(coo);
-    std::cerr << "csr: " << csr.num_rows() << "x" << csr.num_cols() << " w/ " << csr.nnz() << "\n";
-    return csr;
-};
-
-std::vector<float> random_vector(const int64_t n) {
-    return std::vector<float>(n, 1.0);
-}
-
-Array<Where::host, float> random_array(const int64_t n) {
-    return Array<Where::host, float>(n, 1.0);
-}
-
-#if 0
-int send_x(int dst, int src, std::vector<float> &&v, MPI_Comm comm) {
-    MPI_Send(v.data(), v.size(), MPI_FLOAT, dst, Tag::x, comm);
-    return 0;
-}
-#endif
 
 /* recv some amount of data, and put it in the right place
    in a full x
@@ -152,10 +74,10 @@ int main (int argc, char **argv) {
     // int64_t n = 150000;
     // int64_t nnz = 11000000;
     // or
-    int64_t m = 150000;
+    int64_t m = 15000;
     int64_t n = m;
     int64_t bw = m/size; // ~50% local vs remote non-zeros for most ranks
-    int64_t nnz = 11000000;
+    int64_t nnz = 1100000;
 
     CsrMat<Where::host> A; // "local A"
 
@@ -168,29 +90,21 @@ int main (int argc, char **argv) {
     
     RowPartSpmv spmv(A, 0, MPI_COMM_WORLD);
 
-
-    std::cerr << "A:        " << A.num_rows()         << "x" << A.num_cols() << " w/ " << A.nnz() << "\n";
+    if (0 == rank) {
+        std::cerr << "A:        " << A.num_rows()         << "x" << A.num_cols() << " w/ " << A.nnz() << "\n";
+    }
     std::cerr << "local A:  " << spmv.lA().num_rows() << "x" << spmv.lA().num_cols() << " w/ " << spmv.lA().nnz() << "\n";
     std::cerr << "remote A: " << spmv.rA().num_rows() << "x" << spmv.rA().num_cols() << " w/ " << spmv.rA().nnz() << "\n";
 
-
-    int loPrio, hiPrio;
-    CUDA_RUNTIME(cudaDeviceGetStreamPriorityRange (&loPrio, &hiPrio));
-
-    cudaStream_t loS, hiS; // "lo/hi prio"
-    CUDA_RUNTIME(cudaStreamCreateWithPriority(&loS, cudaStreamNonBlocking, hiPrio));
-    CUDA_RUNTIME(cudaStreamCreateWithPriority(&hiS, cudaStreamNonBlocking, hiPrio));
-
-    cudaEvent_t event;
-    CUDA_RUNTIME(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
-
-    const int nIters = 30;
+    const int nIters = 1;
     std::vector<double> times(nIters);
 
     nvtxRangePush("overlap");
     for (int i = 0; i < nIters; ++i) {
         MPI_Barrier(MPI_COMM_WORLD);
         double start = MPI_Wtime();
+        spmv.pack_x_async();
+        spmv.pack_x_wait();
         spmv.send_x_async();
         spmv.launch_local();
         spmv.recv_x_async();
