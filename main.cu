@@ -475,7 +475,7 @@ CsrMat<Where::host> random_band_matrix(const int64_t n, const int64_t bw, const 
             int lb = r - bw;
             int ub = r + bw + 1;
             int64_t c = rand() % (ub - lb) + lb;
-            if (c < 0 || c > n) {
+            if (c < 0 || c >= n) {
                 continue; // don't over-weight first or last column
             }
             
