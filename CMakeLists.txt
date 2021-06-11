@@ -97,3 +97,12 @@ if (MPI_FOUND)
   set_cxx_standard(main)
 endif()
 
+if (MPI_FOUND)
+  add_executable(overlap overlap.cu)
+  target_include_directories(overlap PRIVATE SYSTEM ${MPI_CXX_INCLUDE_DIRS})
+  target_link_libraries(overlap ${MPI_CXX_LIBRARIES})
+  target_link_libraries(overlap CUDA::nvToolsExt)
+  set_cxx_options(overlap)
+  set_cxx_standard(overlap)
+endif()
+
